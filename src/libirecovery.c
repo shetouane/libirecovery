@@ -2155,6 +2155,7 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 	irecv_client_t client = *pclient;
 	if (error != IRECV_E_SUCCESS) {
 		irecv_close(client);
+		*pclient = NULL;
 		return error;
 	}
 
@@ -2162,6 +2163,7 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 	if (error != IRECV_E_SUCCESS) {
 		debug("Failed to set configuration, error %d\n", error);
 		irecv_close(client);
+		*pclient = NULL;
 		return error;
 	}
 
@@ -2169,6 +2171,7 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 	error = (*client->handle)->CreateDeviceAsyncEventSource(client->handle, &client->async_event_source);
 	if (error != IRECV_E_SUCCESS) {
 		free(client);
+		*pclient = NULL;
 		return error;
 	}
 	CFRunLoopAddSource(CFRunLoopGetCurrent(), client->async_event_source, kCFRunLoopDefaultMode);
@@ -2186,6 +2189,7 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 	if (error != IRECV_E_SUCCESS) {
 		debug("Failed to set interface, error %d\n", error);
 		irecv_close(client);
+		*pclient = NULL;
 		return error;
 	}
 
@@ -2194,6 +2198,7 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 		if (error != IRECV_E_SUCCESS) {
 			debug("irecv_kis_init failed, error %d\n", error);
 			irecv_close(client);
+			*pclient = NULL;
 			return error;
 		}
 
@@ -2201,10 +2206,12 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 		if (error != IRECV_E_SUCCESS) {
 			debug("irecv_kis_load_device_info failed, error %d\n", error);
 			irecv_close(client);
+			*pclient = NULL;
 			return error;
 		}
 		if (ecid != 0 && client->device_info.ecid != ecid) {
 			irecv_close(client);
+			*pclient = NULL;
 			return IRECV_E_NO_DEVICE; //wrong device
 		}
 		debug("found device with ECID %016" PRIx64 "\n", (uint64_t)client->device_info.ecid);
