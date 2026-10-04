@@ -796,6 +796,9 @@ static int iokit_get_string_descriptor_ascii(irecv_client_t client, uint8_t desc
 
 static int irecv_get_string_descriptor_ascii(irecv_client_t client, uint8_t desc_index, unsigned char * buffer, int size)
 {
+	if (!client || !client->handle || desc_index == 0 || !buffer || size <= 0) {
+		return 0;
+	}
 #ifndef _WIN32
 #ifdef HAVE_IOKIT
 	return iokit_get_string_descriptor_ascii(client, desc_index, buffer, size);
@@ -2047,6 +2050,23 @@ static irecv_error_t libusb_usb_open_handle_with_descriptor_and_ecid(irecv_clien
 	client->handle = usb_handle;
 	client->mode = usb_descriptor->idProduct;
 
+#ifndef _WIN32
+#ifndef HAVE_IOKIT
+	/* On Android with wrapped FDs, ALL modes need interface claiming for USB
+	 * control transfers to work. On PC/Linux, DFU/WTF skip this. */
+#if defined(__ANDROID__)
+	/* Android: always claim interface 0 for every mode (Recovery, DFU, WTF).
+	 * Skip detach_kernel_driver since Android's USB framework owns the device. */
+	(void)libusb_claim_interface(client->handle, client->usb_interface);
+#else
+	if ((client->mode != IRECV_K_DFU_MODE) && (client->mode != IRECV_K_PORT_DFU_MODE) && (client->mode != IRECV_K_WTF_MODE) && (client->isKIS == 0)) {
+		libusb_detach_kernel_driver(client->handle, client->usb_interface);
+		libusb_claim_interface(client->handle, client->usb_interface);
+	}
+#endif
+#endif
+#endif
+
 	if (client->mode != KIS_PRODUCT_ID) {
 		char serial_str[256];
 		memset(serial_str, 0, sizeof(serial_str));
@@ -2075,6 +2095,69 @@ static irecv_error_t libusb_open_with_ecid(irecv_client_t* pclient, uint64_t eci
 	struct libusb_device_descriptor usb_descriptor;
 
 	*pclient = NULL;
+
+#if defined(__ANDROID__)
+	/* On Android: If direct root access to /dev/bus/usb is available (e.g. root granted),
+	 * use standard direct libusb device scanning (same as PC).
+	 * If non-root, fall back to Java UsbManager FD handover with dup(fd). */
+	{
+		extern int android_has_root_usb_access(void);
+		if (!android_has_root_usb_access()) {
+			extern int android_get_usb_fd(void);
+			int android_fd = android_get_usb_fd();
+			if (android_fd > 0) {
+				struct libusb_device_handle* usb_handle = NULL;
+				int dup_fd = dup(android_fd);
+				if (dup_fd < 0) dup_fd = android_fd;
+				if (libirecovery_context == NULL) {
+					int init_res = libusb_init(&libirecovery_context);
+					if (init_res != LIBUSB_SUCCESS || libirecovery_context == NULL) {
+						debug("Android: libusb_init failed with error %d\n", init_res);
+						if (dup_fd >= 0 && dup_fd != android_fd) close(dup_fd);
+						return IRECV_E_UNABLE_TO_CONNECT;
+					}
+				}
+				int wrap_err = libusb_wrap_sys_device(libirecovery_context, (intptr_t)dup_fd, &usb_handle);
+				if (wrap_err == LIBUSB_SUCCESS && usb_handle != NULL) {
+					/* Get the device descriptor from the wrapped handle */
+					struct libusb_device *wrapped_dev = libusb_get_device(usb_handle);
+					if (wrapped_dev != NULL) {
+						libusb_get_device_descriptor(wrapped_dev, &usb_descriptor);
+						if (usb_descriptor.idVendor == APPLE_VENDOR_ID) {
+							if (usb_descriptor.idProduct == IRECV_K_RECOVERY_MODE_1 ||
+								usb_descriptor.idProduct == IRECV_K_RECOVERY_MODE_2 ||
+								usb_descriptor.idProduct == IRECV_K_RECOVERY_MODE_3 ||
+								usb_descriptor.idProduct == IRECV_K_RECOVERY_MODE_4 ||
+								usb_descriptor.idProduct == IRECV_K_WTF_MODE ||
+								usb_descriptor.idProduct == IRECV_K_DFU_MODE ||
+								usb_descriptor.idProduct == IRECV_K_PORT_DFU_MODE ||
+								usb_descriptor.idProduct == KIS_PRODUCT_ID) {
+
+								debug("Android: opening device %04x:%04x via dup FD %d (master FD %d)...\n",
+									usb_descriptor.idVendor, usb_descriptor.idProduct, dup_fd, android_fd);
+
+								ret = libusb_usb_open_handle_with_descriptor_and_ecid(pclient, usb_handle, &usb_descriptor, ecid);
+								if (ret == IRECV_E_SUCCESS) {
+									return ret;
+								}
+							}
+						}
+					}
+					/* If we get here, opening failed or wrapped device wasn't what we wanted */
+					libusb_close(usb_handle);
+				} else {
+					if (dup_fd >= 0 && dup_fd != android_fd) close(dup_fd);
+					debug("Android: libusb_wrap_sys_device failed for FD %d: %s\n",
+						android_fd, libusb_error_name(wrap_err));
+				}
+			}
+		} else {
+			debug("Android: Root USB access active (/dev/bus/usb is accessible), using standard direct libusb scanning.\n");
+		}
+	}
+	/* Fall through to standard direct libusb path (PC path / Root path) */
+#endif /* __ANDROID__ */
+
 	int usb_device_count = libusb_get_device_list(libirecovery_context, &usb_device_list);
 	for (i = 0; i < usb_device_count; i++) {
 		usb_device = usb_device_list[i];
@@ -2159,6 +2242,14 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 		return error;
 	}
 
+#if defined(__ANDROID__)
+	/* On Android, the USB framework (UsbDeviceConnection) already sets
+	 * configuration 1 when opening. Calling libusb_set_configuration on a
+	 * wrapped FD will SIGSEGV/SIGABRT because the kernel interface has
+	 * already been claimed by the framework. Skip it entirely. */
+	client->usb_config = 1;
+	debug("Android: skipping set_configuration (already set by framework)\n");
+#else
 	error = irecv_usb_set_configuration(client, 1);
 	if (error != IRECV_E_SUCCESS) {
 		debug("Failed to set configuration, error %d\n", error);
@@ -2166,6 +2257,7 @@ irecv_error_t irecv_open_with_ecid(irecv_client_t* pclient, uint64_t ecid)
 		*pclient = NULL;
 		return error;
 	}
+#endif
 
 #ifdef HAVE_IOKIT
 	error = (*client->handle)->CreateDeviceAsyncEventSource(client->handle, &client->async_event_source);
@@ -2367,6 +2459,19 @@ irecv_error_t irecv_usb_set_interface(irecv_client_t client, int usb_interface, 
 		return IRECV_E_USB_INTERFACE;
 	}
 #else
+#if defined(__ANDROID__)
+	/* On Android, interface 0 is already claimed during device open.
+	 * Re-claiming would return LIBUSB_ERROR_BUSY and abort. Only claim
+	 * interface 1 if explicitly requested (for Recovery Mode 3/4). */
+	if (usb_interface == 1) {
+		if (libusb_claim_interface(client->handle, usb_interface) < 0) {
+			return IRECV_E_USB_INTERFACE;
+		}
+		if (libusb_set_interface_alt_setting(client->handle, usb_interface, usb_alt_interface) < 0) {
+			return IRECV_E_USB_INTERFACE;
+		}
+	}
+#else
 	if (libusb_claim_interface(client->handle, usb_interface) < 0) {
 		return IRECV_E_USB_INTERFACE;
 	}
@@ -2376,6 +2481,7 @@ irecv_error_t irecv_usb_set_interface(irecv_client_t client, int usb_interface, 
 			return IRECV_E_USB_INTERFACE;
 		}
 	}
+#endif
 #endif
 #else
 	if (usb_interface == 1) {
@@ -2754,12 +2860,40 @@ static void* _irecv_handle_device_add(void *userdata)
 	uint8_t address = libusb_get_device_address(device);
 	location = (bus << 16) | address;
 
+#if defined(__ANDROID__)
+	/* Try Android FD-based path first */
+	{
+		extern int android_get_usb_fd(void);
+		extern int android_has_root_usb_access(void);
+		int android_fd = android_get_usb_fd();
+		if (android_fd > 0 && !android_has_root_usb_access()) {
+			/* Non-root: use dup(fd) so libusb_close won't destroy Java's master FD */
+			int dup_fd = dup(android_fd);
+			if (dup_fd < 0) dup_fd = android_fd;
+			int wrap_err = libusb_wrap_sys_device(libirecovery_context, (intptr_t)dup_fd, &usb_handle);
+			if (wrap_err != LIBUSB_SUCCESS || usb_handle == NULL) {
+				if (dup_fd >= 0 && dup_fd != android_fd) close(dup_fd);
+				debug("%s: Android: libusb_wrap_sys_device failed: %s\n", __func__, libusb_error_name(wrap_err));
+				return 0;
+			}
+		} else {
+			/* Root mode or no FD — try standard direct libusb_open */
+			libusb_error = libusb_open(device, &usb_handle);
+			if (usb_handle == NULL || libusb_error != 0) {
+				debug("%s: ERROR: can't connect to device: %s\n", __func__, libusb_error_name(libusb_error));
+				if (usb_handle) libusb_close(usb_handle);
+				return 0;
+			}
+		}
+	}
+#else
 	libusb_error = libusb_open(device, &usb_handle);
 	if (usb_handle == NULL || libusb_error != 0) {
 		debug("%s: ERROR: can't connect to device: %s\n", __func__, libusb_error_name(libusb_error));
 		libusb_close(usb_handle);
 		return 0;
 	}
+#endif
 
 	if (product_id == KIS_PRODUCT_ID) {
 		error = libusb_usb_open_handle_with_descriptor_and_ecid(&client, usb_handle, &devdesc, 0);
@@ -3405,9 +3539,14 @@ static irecv_error_t irecv_cleanup(irecv_client_t client)
 		}
 #else
 		if (client->handle != NULL) {
+#if defined(__ANDROID__)
+			/* On Android we claim interface 0 for ALL modes, so always release */
+			libusb_release_interface(client->handle, client->usb_interface);
+#else
 			if ((client->mode != IRECV_K_DFU_MODE) && (client->mode != IRECV_K_PORT_DFU_MODE) && (client->mode != IRECV_K_WTF_MODE) && (client->isKIS == 0)) {
 				libusb_release_interface(client->handle, client->usb_interface);
 			}
+#endif
 			libusb_close(client->handle);
 			client->handle = NULL;
 		}
