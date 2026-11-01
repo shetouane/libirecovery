@@ -3084,6 +3084,16 @@ static void iokit_device_removed(void *refcon, io_iterator_t iterator)
 }
 #else /* !HAVE_IOKIT */
 #ifdef HAVE_LIBUSB_HOTPLUG_API
+/* Runs _irecv_handle_device_add on the hotplug worker thread and then releases
+ * the reference taken in _irecv_usb_hotplug_cb, keeping the libusb_device alive
+ * for as long as this thread uses it. */
+static void *_irecv_handle_device_add_thread(void *userdata)
+{
+	void *ret = _irecv_handle_device_add(userdata);
+	libusb_unref_device((libusb_device*)userdata);
+	return ret;
+}
+
 static int _irecv_usb_hotplug_cb(libusb_context *ctx, libusb_device *device, libusb_hotplug_event event, void *user_data)
 {
 	if (!_irecv_is_recovery_device(device)) {
@@ -3091,8 +3101,20 @@ static int _irecv_usb_hotplug_cb(libusb_context *ctx, libusb_device *device, lib
 	}
 	if (event == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) {
 		THREAD_T th_device;
-		if (thread_new(&th_device, _irecv_handle_device_add, device) != 0) {
+		/* The libusb_device passed to a hotplug callback is only guaranteed to
+		 * stay valid for the duration of this callback. Because the device is
+		 * handled on a detached worker thread (which reads its descriptor and
+		 * opens it), take an extra reference here so it is not freed if the
+		 * device disconnects in the meantime - e.g. during a checkm8/pwndfu
+		 * reboot, where the DFU device rapidly disconnects and reconnects.
+		 * Without this, the worker thread can call
+		 * libusb_get_device_descriptor()/libusb_ref_device() on a dangling
+		 * pointer and crash. The reference is released by the wrapper thread
+		 * once handling is done. */
+		libusb_ref_device(device);
+		if (thread_new(&th_device, _irecv_handle_device_add_thread, device) != 0) {
 			debug("%s: FATAL: failed to create thread to handle device add\n", __func__);
+			libusb_unref_device(device);
 			return 0;
 		}
 		thread_detach(th_device);
